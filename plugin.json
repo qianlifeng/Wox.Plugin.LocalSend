@@ -1,14 +1,25 @@
 {
-  "Id": "[Id]",
-  "TriggerKeywords": ["[Trigger Keyword]"],
-  "Name": "[Name]",
-  "Description": "[Description]",
-  "Author": "[Author Name]",
+  "Id": "com.wox.plugin.localsend",
+  "TriggerKeywords": [
+    "*"
+  ],
+  "Name": "LocalSend",
+  "Description": "Share files via LocalSend protocol",
+  "Author": "qianlifeng",
   "Version": "0.0.1",
   "MinWoxVersion": "2.0.0",
   "Runtime": "nodejs",
-  "Website": "[Website]",
+  "Website": "https://github.com/qianlifeng/Wox.Plugin.LocalSend",
   "Entry": "index.js",
   "Icon": "relative:images/app.png",
-  "SupportedOS": ["windows", "linux", "darwin"]
+  "SupportedOS": [
+    "windows",
+    "linux",
+    "darwin"
+  ],
+  "Features": [
+    {
+      "Name": "querySelection"
+    }
+  ]
 }

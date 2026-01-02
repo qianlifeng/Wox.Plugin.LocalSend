@@ -6,8 +6,11 @@ settings:
 
 dependencies:
   '@wox-launcher/wox-plugin':
-    specifier: ^0.0.107
-    version: 0.0.107
+    specifier: ^0.0.111
+    version: 0.0.111
+  uuid:
+    specifier: ^11.0.0
+    version: 11.1.0
 
 devDependencies:
   '@babel/cli':
@@ -28,6 +31,9 @@ devDependencies:
   '@types/node':
     specifier: ^24.6.1
     version: 24.10.1
+  '@types/uuid':
+    specifier: ^10.0.0
+    version: 10.0.0
   '@vercel/ncc':
     specifier: ^0.38.1
     version: 0.38.4
@@ -1741,6 +1747,10 @@ packages:
     resolution: {integrity: sha512-9aEbYZ3TbYMznPdcdr3SmIrLXwC/AKZXQeCf9Pgao5CKb8CyHuEX5jzWPTkvregvhRJHcpRO6BFoGW9ycaOkYw==}
     dev: true
 
+  /@types/uuid@10.0.0:
+    resolution: {integrity: sha512-7gqG38EyHgyP1S+7+xomFtL+ZNHcKv6DwNaCZmJmo1vgMugyF3TCnXVg4t1uk89mLNwnLtnY3TpOpCOyp1/xHQ==}
+    dev: true
+
   /@types/yargs-parser@21.0.3:
     resolution: {integrity: sha512-I4q9QU9MQv4oEOz4tAHJtNz1cwuLxn2F3xcc2iV5WdqLPpUnj30aUuxt1mAxYTG+oe8CZMV/+6rU4S4gRDzqtQ==}
     dev: true
@@ -1897,8 +1907,8 @@ packages:
     hasBin: true
     dev: true
 
-  /@wox-launcher/wox-plugin@0.0.107:
-    resolution: {integrity: sha512-4KrzPHTj+3czlHEaOrGVyzNgUPi/HDW6F9ZF8O83oNCXM0HYU6/sYr/MTXo6uCc7vpzeAu2xrf1kFDXLBbzzCA==}
+  /@wox-launcher/wox-plugin@0.0.111:
+    resolution: {integrity: sha512-U+uQInllTtfacwOIC1Qbjp2/CfLOZGnfK5dZq+Bir6fEbL3SJ393TeHt/9yKOBpRi0sMWyQ2h2m59hl01Ykjdg==}
     dev: false
 
   /acorn-jsx@5.3.2(acorn@8.15.0):
@@ -4053,6 +4063,11 @@ packages:
     dependencies:
       punycode: 2.3.1
     dev: true
+
+  /uuid@11.1.0:
+    resolution: {integrity: sha512-0/A9rDy9P7cJ+8w1c9WD9V//9Wj15Ce2MPz8Ri6032usz+NfePxx5AcN3bN+r6ZL6jEo066/yNYB3tn4pQEx+A==}
+    hasBin: true
+    dev: false
 
   /v8-to-istanbul@9.3.0:
     resolution: {integrity: sha512-kiGUalWN+rgBJ/1OHZsBtU4rXZOfj/7rKQxULKlIzwzQSvMJUUNgPwJEEh7gU6xEVxC0ahoOBvN2YI8GH6FNgA==}
