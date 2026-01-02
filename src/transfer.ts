@@ -113,7 +113,14 @@ export async function createFileInfo(filePath: string): Promise<FileInfo> {
 }
 
 // HTTP request utility
-function makeRequest(device: LocalSendDevice, requestPath: string, method: string, body?: string | Buffer, contentType?: string): Promise<{ statusCode: number; body: string }> {
+function makeRequest(
+  device: LocalSendDevice,
+  requestPath: string,
+  method: string,
+  body?: string | Buffer,
+  contentType?: string,
+  timeout: number = 30000
+): Promise<{ statusCode: number; body: string }> {
   return new Promise((resolve, reject) => {
     const headers: http.OutgoingHttpHeaders = {
       "Content-Type": contentType || "application/json"
@@ -130,7 +137,7 @@ function makeRequest(device: LocalSendDevice, requestPath: string, method: strin
       method,
       headers,
       rejectUnauthorized: false, // Ignore self-signed certificates
-      timeout: 30000
+      timeout: timeout
     }
 
     const client = device.protocol === "https" ? https : http
@@ -147,7 +154,7 @@ function makeRequest(device: LocalSendDevice, requestPath: string, method: strin
     req.on("error", reject)
     req.on("timeout", () => {
       req.destroy()
-      reject(new Error("Request timeout"))
+      reject(new Error("i18n:error_timeout"))
     })
 
     if (body) {
@@ -169,7 +176,8 @@ export async function prepareUpload(device: LocalSendDevice, files: FileInfo[]):
     files: filesMap
   }
 
-  const response = await makeRequest(device, "/api/localsend/v2/prepare-upload", "POST", JSON.stringify(requestBody))
+  // Use longer timeout (60s) to allow user to accept/reject on receiving device
+  const response = await makeRequest(device, "/api/localsend/v2/prepare-upload", "POST", JSON.stringify(requestBody), "application/json", 60000)
 
   if (response.statusCode === 204) {
     // No transfer needed (file may already exist)
@@ -177,25 +185,25 @@ export async function prepareUpload(device: LocalSendDevice, files: FileInfo[]):
   }
 
   if (response.statusCode !== 200) {
-    let errorMsg = "Upload rejected"
+    let errorMsg = "i18n:error_rejected"
     switch (response.statusCode) {
       case 400:
-        errorMsg = "Invalid request"
+        errorMsg = "i18n:error_invalid"
         break
       case 401:
-        errorMsg = "PIN required"
+        errorMsg = "i18n:error_pin"
         break
       case 403:
-        errorMsg = "Request rejected by receiver"
+        errorMsg = "i18n:error_refused"
         break
       case 409:
-        errorMsg = "Receiver is busy with another transfer"
+        errorMsg = "i18n:error_busy"
         break
       case 429:
-        errorMsg = "Too many requests"
+        errorMsg = "i18n:error_too_many"
         break
       case 500:
-        errorMsg = "Receiver error"
+        errorMsg = "i18n:error_receiver"
         break
     }
     throw new Error(errorMsg)
@@ -231,14 +239,19 @@ export async function cancelTransfer(device: LocalSendDevice, sessionId: string)
 }
 
 // High-level API: Send files to device
-export async function sendFiles(device: LocalSendDevice, filePaths: string[], onProgress?: (currentIndex: number, totalCount: number, fileName: string) => void): Promise<void> {
+export async function sendFiles(
+  device: LocalSendDevice,
+  filePaths: string[],
+  onProgress?: (currentIndex: number, totalCount: number, fileName: string) => void,
+  onError?: (error: Error, fileName: string) => void
+): Promise<void> {
   // Create file information
   const fileInfos: FileInfo[] = []
   const filePathMap: Map<string, string> = new Map()
 
   for (const filePath of filePaths) {
     if (!fs.existsSync(filePath)) {
-      throw new Error(`File not found: ${filePath}`)
+      throw new Error(`i18n:error_file_not_found: ${filePath}`)
     }
     const info = await createFileInfo(filePath)
     fileInfos.push(info)
@@ -246,7 +259,16 @@ export async function sendFiles(device: LocalSendDevice, filePaths: string[], on
   }
 
   // Prepare upload
-  const session = await prepareUpload(device, fileInfos)
+  let session: TransferSession
+  try {
+    session = await prepareUpload(device, fileInfos)
+  } catch (error) {
+    if (onError) {
+      onError(error instanceof Error ? error : new Error(String(error)), "")
+      return // Stop on prepare failure
+    }
+    throw error
+  }
 
   if (!session.sessionId) {
     // No transfer needed
@@ -261,7 +283,20 @@ export async function sendFiles(device: LocalSendDevice, filePaths: string[], on
     }
 
     const filePath = filePathMap.get(fileInfo.id)!
-    await uploadFile(device, session, fileInfo, filePath)
+    try {
+      await uploadFile(device, session, fileInfo, filePath)
+    } catch (error) {
+      if (onError) {
+        onError(error instanceof Error ? error : new Error(String(error)), fileInfo.fileName)
+        // Should we continue? Usually if one fails, others might still work, but session might be bad.
+        // Let's assume we try to continue or let the user decide.
+        // For now, re-throwing might be too aggressive if we have an error handler.
+        // But if we return here, we stop the queue.
+        // Let's stop the queue on error to be safe.
+        return
+      }
+      throw error
+    }
 
     completed++
   }

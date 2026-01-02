@@ -1,23 +1,155 @@
-import { ActionContext, Context, Plugin, PluginInitParams, PublicAPI, Query, Result } from "@wox-launcher/wox-plugin"
+import { Context, Plugin, PluginInitParams, PublicAPI, Query, Result } from "@wox-launcher/wox-plugin"
 import { findDevices, LocalSendDevice } from "./discovery"
 import { sendFiles } from "./transfer"
 import * as crypto from "crypto"
+import * as fs from "fs"
+import * as path from "path"
+import * as util from "util"
 
 let api: PublicAPI
 
-// Cache for discovered devices
-let cachedDevices: LocalSendDevice[] | null = null
-let isScanning = false
-let lastScanTime = 0
-let lastResultId: string = ""
+// Expand directories to their files recursively
+function expandDirectories(paths: string[]): string[] {
+  const result: string[] = []
+
+  for (const p of paths) {
+    try {
+      const stat = fs.statSync(p)
+      if (stat.isDirectory()) {
+        // Recursively get all files in directory
+        const entries = fs.readdirSync(p)
+        for (const entry of entries) {
+          const fullPath = path.join(p, entry)
+          const expanded = expandDirectories([fullPath])
+          result.push(...expanded)
+        }
+      } else if (stat.isFile()) {
+        result.push(p)
+      }
+    } catch {
+      // Skip files that can't be accessed
+    }
+  }
+
+  return result
+}
+
+const createDiscoveryAction = (currentCtx: Context, resultId: string, filePaths: string[]) => {
+  return async () => {
+    api.Log(currentCtx, "Info", `Discovering LocalSend devices`)
+    await updateResultToScanning(currentCtx, resultId)
+    try {
+      const devices = await findDevices(currentCtx, 3000, api)
+      await updateResultWithDevices(currentCtx, resultId, devices, filePaths)
+    } catch (error) {
+      console.error("Discovery failed:", error)
+      const errorMsg = error instanceof Error ? error.message : "Unknown error"
+      await updateResultWithError(currentCtx, resultId, errorMsg, filePaths)
+    }
+  }
+}
+
+const createSendAction = (targetDevice: LocalSendDevice, files: string[], resultId: string) => {
+  return async (actionCtx: Context) => {
+    await api.Log(actionCtx, "Info", `Sending ${files.length} file(s) to ${targetDevice.alias}...`)
+
+    // Helper to update UI
+    const updateProgress = async (idx: number, total: number, currentFile: string) => {
+      await api.Log(actionCtx, "Info", `Sending ${idx + 1}/${total}: ${currentFile}`)
+      await api.Log(actionCtx, "Debug", `Trying to update result with id: ${resultId}`)
+      try {
+        const result = await api.GetUpdatableResult(actionCtx, resultId)
+        if (result) {
+          if (idx < total) {
+            const sendingTpl = await api.GetTranslation(actionCtx, "sending")
+            const targetTpl = await api.GetTranslation(actionCtx, "target")
+            result.Title = util.format(sendingTpl, idx + 1, total, currentFile)
+            result.SubTitle = util.format(targetTpl, targetDevice.alias)
+          } else {
+            const sentSuccessTpl = await api.GetTranslation(actionCtx, "sent_success")
+            const filesUnit = await api.GetTranslation(actionCtx, "files_unit")
+            const targetTpl = await api.GetTranslation(actionCtx, "target")
+            result.Title = util.format(sentSuccessTpl, total, filesUnit)
+            result.SubTitle = util.format(targetTpl, targetDevice.alias)
+          }
+          await api.UpdateResult(actionCtx, result)
+        } else {
+          await api.Log(actionCtx, "Error", "Failed to update result: Result not found")
+        }
+      } catch (error) {
+        await api.Log(actionCtx, "Error", "Failed to update result: " + error)
+      }
+    }
+
+    try {
+      // Initial status
+      await updateProgress(0, files.length, "i18n:preparing")
+
+      await sendFiles(
+        targetDevice,
+        files,
+        async (current, total, fileName) => {
+          await updateProgress(current, total, fileName)
+        },
+        async (error, fileName) => {
+          const errorMsg = error instanceof Error ? error.message : "Unknown error"
+          try {
+            const result = await api.GetUpdatableResult(actionCtx, resultId)
+            if (result) {
+              result.Title = "i18n:failed_to_send"
+              const errorSendingTpl = await api.GetTranslation(actionCtx, "error_sending")
+              result.SubTitle = fileName ? util.format(errorSendingTpl, fileName, errorMsg) : errorMsg
+              result.Actions = [
+                {
+                  Name: "i18n:retry_send",
+                  PreventHideAfterAction: true,
+                  Action: createSendAction(targetDevice, files, resultId)
+                },
+                {
+                  Name: "i18n:refresh_devices",
+                  PreventHideAfterAction: true,
+                  Action: createDiscoveryAction(actionCtx, resultId, files)
+                }
+              ]
+              await api.UpdateResult(actionCtx, result)
+            }
+          } catch {
+            // Ignore error
+          }
+        }
+      )
+
+      const successTpl = await api.GetTranslation(actionCtx, "successfully_sent")
+      const filesUnit = await api.GetTranslation(actionCtx, "files_unit")
+      await api.Notify(actionCtx, util.format(successTpl, files.length, filesUnit, targetDevice.alias))
+      await api.Log(actionCtx, "Info", `Successfully sent files to ${targetDevice.alias}`)
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : "Unknown error"
+      await api.Notify(actionCtx, `Failed to send files: ${errorMsg}`)
+      await api.Log(actionCtx, "Error", `Failed to send files: ${errorMsg}`)
+
+      // Show error in result
+      try {
+        const result = await api.GetUpdatableResult(actionCtx, resultId)
+        if (result) {
+          result.Title = "i18n:failed_to_send"
+          result.SubTitle = errorMsg
+          await api.UpdateResult(actionCtx, result)
+        }
+      } catch {
+        // Ignore error
+      }
+    }
+  }
+}
 
 // Helper to update result to scanning state
 async function updateResultToScanning(ctx: Context, resultId: string) {
   try {
     const updatable = await api.GetUpdatableResult(ctx, resultId)
     if (updatable) {
-      updatable.Title = "Scanning for LocalSend devices..."
-      updatable.SubTitle = "Please wait..."
+      updatable.Title = "i18n:scanning"
+      updatable.SubTitle = "i18n:please_wait"
       updatable.Actions = []
       await api.UpdateResult(ctx, updatable)
     }
@@ -27,17 +159,17 @@ async function updateResultToScanning(ctx: Context, resultId: string) {
 }
 
 // Helper to update result with error and retry
-async function updateResultWithError(ctx: Context, resultId: string, errorMsg: string, retryAction: (ctx: Context) => Promise<void>) {
+async function updateResultWithError(ctx: Context, resultId: string, errorMsg: string, filePaths: string[]) {
   try {
     const updatable = await api.GetUpdatableResult(ctx, resultId)
     if (updatable) {
-      updatable.Title = "Discovery failed"
+      updatable.Title = "i18n:discovery_failed"
       updatable.SubTitle = errorMsg
       updatable.Actions = [
         {
-          Name: "Retry",
+          Name: "i18n:retry",
           PreventHideAfterAction: true,
-          Action: retryAction
+          Action: createDiscoveryAction(ctx, resultId, filePaths)
         }
       ]
       await api.UpdateResult(ctx, updatable)
@@ -47,35 +179,37 @@ async function updateResultWithError(ctx: Context, resultId: string, errorMsg: s
   }
 }
 
-// Helper to update result with devices
-async function updateResultWithDevices(ctx: Context, resultId: string, devices: LocalSendDevice[], query: Query, filePaths: string[], retryAction: (ctx: Context) => Promise<void>) {
+async function updateResultWithDevices(ctx: Context, resultId: string, devices: LocalSendDevice[], filePaths: string[]) {
   try {
     const updatableResult = await api.GetUpdatableResult(ctx, resultId)
 
     if (devices.length === 0) {
       if (updatableResult) {
-        updatableResult.Title = "No LocalSend devices found"
-        updatableResult.SubTitle = "Make sure LocalSend is running on the target device"
+        updatableResult.Title = "i18n:no_devices_found"
+        updatableResult.SubTitle = "i18n:check_localsend"
         updatableResult.Actions = [
           {
-            Name: "Retry",
+            Name: "i18n:retry",
             PreventHideAfterAction: true,
-            Action: retryAction
+            Action: createDiscoveryAction(ctx, resultId, filePaths)
           }
         ]
         await api.UpdateResult(ctx, updatableResult)
       }
     } else {
-      const results = devicesToResults(devices, filePaths, api)
+      const device = devices[0] // we only show the first device
+      const results = await devicesToResults(ctx, [device], filePaths)
       if (updatableResult) {
         updatableResult.Title = results[0].Title
         updatableResult.SubTitle = results[0].SubTitle
-        updatableResult.Actions = results[0].Actions
+        updatableResult.Actions = [
+          {
+            Name: "i18n:send",
+            PreventHideAfterAction: true,
+            Action: createSendAction(device, filePaths, resultId)
+          }
+        ]
         await api.UpdateResult(ctx, updatableResult)
-      }
-
-      if (devices.length > 1) {
-        await api.PushResults(ctx, query, results.slice(1))
       }
     }
   } catch (e) {
@@ -94,50 +228,30 @@ export const plugin: Plugin = {
       return []
     }
 
-    // Check cache
-    if (cachedDevices && Date.now() - lastScanTime < 5 * 60 * 1000) {
-      return devicesToResults(cachedDevices, query.Selection.FilePaths, api)
+    const resultId = crypto.randomUUID()
+    const filePaths = expandDirectories(query.Selection.FilePaths)
+
+    if (filePaths.length === 0) {
+      return [
+        {
+          Id: resultId,
+          Title: "i18n:no_files",
+          SubTitle: "i18n:folders_empty",
+          Icon: {
+            ImageType: "relative",
+            ImageData: "images/app.png"
+          }
+        }
+      ]
     }
 
-    // Generate a stable ID for this query session's main result
-    lastResultId = crypto.randomUUID()
-    const currentResultId = lastResultId
-
-    // Define the discovery logic
-    const runDiscovery = async (currentCtx: Context) => {
-      // 1. Set to scanning (if retrying)
-      if (!isScanning) {
-        await updateResultToScanning(currentCtx, currentResultId)
-      }
-
-      isScanning = true
-      api.Log(currentCtx, "Info", `Discovering LocalSend devices`)
-
-      try {
-        const devices = await findDevices(currentCtx, 3000, api)
-        cachedDevices = devices
-        lastScanTime = Date.now()
-        isScanning = false
-
-        await updateResultWithDevices(currentCtx, currentResultId, devices, query, query.Selection.FilePaths, runDiscovery)
-      } catch (error) {
-        console.error("Discovery failed:", error)
-        isScanning = false
-        cachedDevices = null
-        const errorMsg = error instanceof Error ? error.message : "Unknown error"
-        await updateResultWithError(currentCtx, currentResultId, errorMsg, runDiscovery)
-      }
-    }
-
-    // Start discovery if not scanning
-    if (!isScanning) {
-      runDiscovery(ctx)
-    }
+    // scan for devices
+    createDiscoveryAction(ctx, resultId, filePaths)()
 
     return [
       {
-        Id: currentResultId,
-        Title: "Scanning for LocalSend devices...",
+        Id: resultId,
+        Title: "i18n:scanning",
         Icon: {
           ImageType: "relative",
           ImageData: "images/app.png"
@@ -147,108 +261,46 @@ export const plugin: Plugin = {
   }
 }
 
-function devicesToResults(devices: LocalSendDevice[], filePaths: string[], api: PublicAPI): Result[] {
-  return devices.map(device => {
-    const resultId = crypto.randomUUID()
+async function devicesToResults(ctx: Context, devices: LocalSendDevice[], filePaths: string[]): Promise<Result[]> {
+  return Promise.all(
+    devices.map(async device => {
+      const resultId = crypto.randomUUID()
+      const sendToTpl = await api.GetTranslation(ctx, "send_to")
 
-    return {
-      Id: resultId,
-      Title: `Send to ${device.alias}`,
-      SubTitle: formatDeviceSubtitle(device),
-      Icon: {
-        ImageType: "relative",
-        ImageData: "images/app.png"
-      },
-      Preview: {
-        PreviewType: "text",
-        PreviewData: `Files to send:\n${filePaths.map(p => `• ${p}`).join("\n")}`,
-        PreviewProperties: {
-          Device: device.alias,
-          IP: device.ip,
-          Protocol: (device.protocol || "HTTPS").toUpperCase(),
-          "File Count": filePaths.length.toString()
-        }
-      },
-      Tails: [
-        {
-          Type: "text",
-          Text: `${filePaths.length} file(s)`
-        }
-      ],
-      Actions: [
-        {
-          Name: "Send",
-          ContextData: {
-            device: JSON.stringify(device),
-            filePaths: JSON.stringify(filePaths),
-            resultId: resultId
-          },
-          PreventHideAfterAction: true,
-          Action: async (actionCtx: Context, actionContext: ActionContext) => {
-            const targetDevice = JSON.parse(actionContext.ContextData.device) as LocalSendDevice
-            const files = JSON.parse(actionContext.ContextData.filePaths) as string[]
-            const rId = actionContext.ContextData.resultId
-
-            await api.Log(actionCtx, "Info", `Sending ${files.length} file(s) to ${targetDevice.alias}...`)
-
-            // Helper to update UI
-            const updateProgress = async (idx: number, total: number, currentFile: string) => {
-              try {
-                const result = await api.GetUpdatableResult(actionCtx, rId)
-                if (result) {
-                  if (idx < total) {
-                    result.Title = `Sending ${idx + 1}/${total}: ${currentFile}`
-                    result.SubTitle = `Target: ${targetDevice.alias}`
-                    // Ideally add a progress bar in Tails or Icon if possible, but text is fine
-                  } else {
-                    result.Title = `Sent ${total} file(s) successfully`
-                    result.SubTitle = `Target: ${targetDevice.alias}`
-                  }
-                  await api.UpdateResult(actionCtx, result)
-                }
-              } catch {
-                // Ignore UI update errors
-              }
-            }
-
-            try {
-              // Initial status
-              await updateProgress(0, files.length, "Preparing...")
-
-              await sendFiles(targetDevice, files, async (current, total, fileName) => {
-                await updateProgress(current, total, fileName)
-              })
-
-              await api.Notify(actionCtx, `Successfully sent ${files.length} file(s) to ${targetDevice.alias}`)
-              await api.Log(actionCtx, "Info", `Successfully sent files to ${targetDevice.alias}`)
-
-              // Close window after short delay or let user close it?
-              // Let's hide it after success
-              setTimeout(async () => {
-                await api.HideApp(actionCtx)
-              }, 1500)
-            } catch (error) {
-              const errorMsg = error instanceof Error ? error.message : "Unknown error"
-              await api.Notify(actionCtx, `Failed to send files: ${errorMsg}`)
-              await api.Log(actionCtx, "Error", `Failed to send files: ${errorMsg}`)
-
-              // Show error in result
-              try {
-                const result = await api.GetUpdatableResult(actionCtx, rId)
-                if (result) {
-                  result.Title = "Failed to send"
-                  result.SubTitle = errorMsg
-                  await api.UpdateResult(actionCtx, result)
-                }
-              } catch {
-                // Ignore error
-              }
-            }
+      return {
+        Id: resultId,
+        Title: util.format(sendToTpl, device.alias),
+        SubTitle: formatDeviceSubtitle(device),
+        Icon: {
+          ImageType: "relative",
+          ImageData: "images/app.png"
+        },
+        Preview: {
+          PreviewType: "text",
+          PreviewData: `i18n:files_to_send\n${filePaths.map(p => `• ${p}`).join("\n")}`,
+          PreviewProperties: {
+            "i18n:device_label": device.alias,
+            "i18n:ip_label": device.ip,
+            "i18n:protocol_label": (device.protocol || "HTTPS").toUpperCase(),
+            "i18n:file_count_label": filePaths.length.toString()
           }
-        }
-      ]
-    }
-  })
+        },
+        Tails: [
+          {
+            Type: "text",
+            Text: `${filePaths.length} i18n:files_unit`
+          }
+        ],
+        Actions: [
+          {
+            Name: "i18n:send",
+            PreventHideAfterAction: true,
+            Action: createSendAction(device, filePaths, resultId)
+          }
+        ]
+      }
+    })
+  )
 }
 
 function formatDeviceSubtitle(device: LocalSendDevice): string {
