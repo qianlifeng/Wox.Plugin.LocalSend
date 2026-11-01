@@ -2,11 +2,11 @@
   "name": "wox-plugin-localsend",
   "version": "0.0.1",
   "scripts": {
-    "build": "pnpm clean && ncc build src/index.ts -o dist && babel dist --out-dir dist && cp -r images dist && cp -r plugin.json dist",
+    "build": "pnpm clean && ncc build src/index.ts -o dist && babel dist --out-dir dist && node -e \"require('fs').cpSync('images', 'dist/images', { recursive: true }); require('fs').copyFileSync('plugin.json', 'dist/plugin.json')\"",
     "package": "pnpm build && cd dist && zip -r ../wox-plugin-localsend.wox *.js *.json images",
     "dev": "nodemon --watch src --watch images --watch plugin.json --ext json,ts,js,mjs,png --exec pnpm run build",
-    "clean": "node -e \"var { rmdirSync, existsSync } = require('fs'), path = require('path'); ['./dist'].forEach(fPath =>{if (existsSync(path.join(__dirname, fPath))) rmdirSync(path.join(__dirname, fPath), { recursive: true })}); process.exit(0);\"",
-    "clean:all": "pnpm run clean && (rm -r ./node_modules || true)",
+    "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
+    "clean:all": "pnpm run clean && node -e \"require('fs').rmSync('node_modules', { recursive: true, force: true })\"",
     "lint": "eslint",
     "prettier:check": "prettier --check src/**/* **/*.json .github/**/* README.md",
     "prettier:write": "prettier --write src/**/* **/*.json .github/**/* README.md",
@@ -20,6 +20,7 @@
     "@eslint/js": "^9.25.0",
     "@types/jest": "^29.5.12",
     "@types/node": "^24.6.1",
+    "@types/node-forge": "1.3.14",
     "@types/uuid": "^10.0.0",
     "@vercel/ncc": "^0.38.1",
     "babel-plugin-transform-import-meta": "^2.2.1",
@@ -32,7 +33,8 @@
     "typescript-eslint": "^8.45.0"
   },
   "dependencies": {
-    "@wox-launcher/wox-plugin": "^0.0.111",
+    "@wox-launcher/wox-plugin": "^0.0.144",
+    "node-forge": "1.4.2",
     "uuid": "^11.0.0"
   }
 }

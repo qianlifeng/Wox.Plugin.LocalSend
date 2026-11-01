@@ -4,6 +4,7 @@ import * as fs from "fs"
 import * as path from "path"
 import * as crypto from "crypto"
 import { LocalSendDevice } from "./discovery"
+import { ReceiverIdentity } from "./receiver"
 
 // File information
 export interface FileInfo {
@@ -25,16 +26,12 @@ export interface TransferSession {
   files: { [fileId: string]: string } // fileId -> token mapping
 }
 
-// Sender information
-interface SenderInfo {
-  alias: string
-  version: string
-  deviceModel: string | null
-  deviceType: string
-  fingerprint: string
-  port: number
-  protocol: string
-  download: boolean
+let senderInfo: ReceiverIdentity
+let senderCredentials: { key: string; cert: string }
+
+export function configureSender(identity: ReceiverIdentity, credentials: { key: string; cert: string }): void {
+  senderInfo = identity
+  senderCredentials = credentials
 }
 
 // Get MIME type
@@ -77,20 +74,6 @@ async function calculateSha256(filePath: string): Promise<string> {
 // Generate unique ID
 function generateId(): string {
   return crypto.randomUUID()
-}
-
-// Get sender information
-function getSenderInfo(): SenderInfo {
-  return {
-    alias: "Wox",
-    version: "2.0",
-    deviceModel: "Wox",
-    deviceType: "desktop",
-    fingerprint: generateId(),
-    port: 53317,
-    protocol: "https",
-    download: false
-  }
 }
 
 // Create FileInfo from file path
@@ -136,6 +119,7 @@ function makeRequest(
       path: requestPath,
       method,
       headers,
+      ...(device.protocol === "https" ? senderCredentials : {}),
       rejectUnauthorized: false, // Ignore self-signed certificates
       timeout: timeout
     }
@@ -172,7 +156,7 @@ export async function prepareUpload(device: LocalSendDevice, files: FileInfo[]):
   }
 
   const requestBody = {
-    info: getSenderInfo(),
+    info: senderInfo,
     files: filesMap
   }
 
@@ -242,9 +226,9 @@ export async function cancelTransfer(device: LocalSendDevice, sessionId: string)
 export async function sendFiles(
   device: LocalSendDevice,
   filePaths: string[],
-  onProgress?: (currentIndex: number, totalCount: number, fileName: string) => void,
-  onError?: (error: Error, fileName: string) => void
-): Promise<void> {
+  onProgress?: (currentIndex: number, totalCount: number, fileName: string) => void | Promise<void>,
+  onError?: (error: Error, fileName: string) => void | Promise<void>
+): Promise<boolean> {
   // Create file information
   const fileInfos: FileInfo[] = []
   const filePathMap: Map<string, string> = new Map()
@@ -264,22 +248,22 @@ export async function sendFiles(
     session = await prepareUpload(device, fileInfos)
   } catch (error) {
     if (onError) {
-      onError(error instanceof Error ? error : new Error(String(error)), "")
-      return // Stop on prepare failure
+      await onError(error instanceof Error ? error : new Error(String(error)), "")
+      return false
     }
     throw error
   }
 
   if (!session.sessionId) {
     // No transfer needed
-    return
+    return true
   }
 
   // Upload each file
   let completed = 0
   for (const fileInfo of fileInfos) {
     if (onProgress) {
-      onProgress(completed, fileInfos.length, fileInfo.fileName)
+      await onProgress(completed, fileInfos.length, fileInfo.fileName)
     }
 
     const filePath = filePathMap.get(fileInfo.id)!
@@ -287,13 +271,8 @@ export async function sendFiles(
       await uploadFile(device, session, fileInfo, filePath)
     } catch (error) {
       if (onError) {
-        onError(error instanceof Error ? error : new Error(String(error)), fileInfo.fileName)
-        // Should we continue? Usually if one fails, others might still work, but session might be bad.
-        // Let's assume we try to continue or let the user decide.
-        // For now, re-throwing might be too aggressive if we have an error handler.
-        // But if we return here, we stop the queue.
-        // Let's stop the queue on error to be safe.
-        return
+        await onError(error instanceof Error ? error : new Error(String(error)), fileInfo.fileName)
+        return false
       }
       throw error
     }
@@ -301,8 +280,5 @@ export async function sendFiles(
     completed++
   }
 
-  // Final progress update
-  if (onProgress) {
-    onProgress(fileInfos.length, fileInfos.length, "")
-  }
+  return true
 }

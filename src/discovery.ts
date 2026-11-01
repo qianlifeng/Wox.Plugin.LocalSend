@@ -1,11 +1,18 @@
 import * as https from "https"
 import * as http from "http"
 import * as os from "os"
-import { v4 as uuidv4 } from "uuid"
+import * as dgram from "dgram"
 import { Context, PublicAPI } from "@wox-launcher/wox-plugin"
+import { ReceiverIdentity } from "./receiver"
 
 // LocalSend default configuration
 const DEFAULT_PORT = 53317
+const MULTICAST_ADDRESS = "224.0.0.167"
+let identity: ReceiverIdentity
+let credentials: { key: string; cert: string }
+let multicastSocket: dgram.Socket | undefined
+const multicastDevices = new Map<string, LocalSendDevice>()
+let onDeviceFound: ((device: LocalSendDevice) => void) | undefined
 
 // Device type
 export type DeviceType = "mobile" | "desktop" | "web" | "headless" | "server"
@@ -23,32 +30,8 @@ export interface LocalSendDevice {
   download?: boolean
 }
 
-// Local device information
-interface DeviceInfo {
-  alias: string
-  version: string
-  deviceModel: string | null
-  deviceType: DeviceType
-  fingerprint: string
-  port: number
-  protocol: "http" | "https"
-  download: boolean
-  announce: boolean
-}
-
-// Generate local device info
-function getLocalDeviceInfo(announce: boolean): DeviceInfo {
-  return {
-    alias: os.hostname() || "Wox User",
-    version: "2.0",
-    deviceModel: os.platform(),
-    deviceType: "desktop",
-    fingerprint: uuidv4(),
-    port: DEFAULT_PORT,
-    protocol: "https",
-    download: false,
-    announce
-  }
+function getLocalDeviceInfo(announce: boolean): ReceiverIdentity & { announce: boolean } {
+  return { ...identity, announce }
 }
 
 // Get local IP address list
@@ -83,6 +66,7 @@ async function registerWithDevice(ip: string, port: number, protocol: "http" | "
         "Content-Type": "application/json",
         "Content-Length": Buffer.byteLength(postData)
       },
+      ...(protocol === "https" ? credentials : {}),
       rejectUnauthorized: false, // Ignore self-signed certificates
       timeout: 1000
     }
@@ -95,10 +79,12 @@ async function registerWithDevice(ip: string, port: number, protocol: "http" | "
       })
       res.on("end", () => {
         try {
+          if (res.statusCode !== 200) return resolve(null)
           const device = JSON.parse(data) as Omit<LocalSendDevice, "ip">
+          if (typeof device.alias !== "string" || typeof device.fingerprint !== "string") return resolve(null)
           resolve({
             ...device,
-            protocol: device.protocol || "https",
+            protocol: device.protocol || protocol,
             port: device.port || port || 53317,
             ip
           })
@@ -122,41 +108,121 @@ async function registerWithDevice(ip: string, port: number, protocol: "http" | "
   })
 }
 
+function announce(announceRequest: boolean): void {
+  if (!multicastSocket) return
+  const message = Buffer.from(JSON.stringify(getLocalDeviceInfo(announceRequest)))
+  for (const ip of getLocalIPs()) {
+    try {
+      multicastSocket.setMulticastInterface(ip)
+      multicastSocket.send(message, DEFAULT_PORT, MULTICAST_ADDRESS, () => {})
+    } catch {
+      /* An interface may not support multicast. */
+    }
+  }
+}
+
+export async function startDiscovery(
+  localIdentity: ReceiverIdentity,
+  clientCredentials: { key: string; cert: string },
+  onError: (error: Error) => void,
+  onDevice?: (device: LocalSendDevice) => void
+): Promise<() => void> {
+  identity = localIdentity
+  credentials = clientCredentials
+  onDeviceFound = onDevice
+  multicastDevices.clear()
+  const socket = dgram.createSocket({ type: "udp4", reuseAddr: true })
+  multicastSocket = socket
+  socket.on("message", (message, remote) => {
+    try {
+      const device = JSON.parse(message.toString()) as LocalSendDevice & { announce?: boolean }
+      if (
+        device.fingerprint === identity.fingerprint ||
+        typeof device.alias !== "string" ||
+        typeof device.fingerprint !== "string" ||
+        !device.fingerprint ||
+        (device.protocol !== "http" && device.protocol !== "https") ||
+        !Number.isInteger(device.port) ||
+        device.port < 1 ||
+        device.port > 65535
+      )
+        return
+      const { announce: shouldAnnounce, ...info } = device
+      const found = { ...info, ip: remote.address }
+      multicastDevices.set(device.fingerprint, found)
+      onDeviceFound?.(found)
+      if (shouldAnnounce === true) announce(false)
+    } catch {
+      /* Ignore unrelated multicast packets. */
+    }
+  })
+  socket.on("error", onError)
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const fail = (error: Error) => reject(error)
+      socket.once("error", fail)
+      socket.bind(DEFAULT_PORT, "0.0.0.0", () => {
+        socket.off("error", fail)
+        for (const ip of getLocalIPs()) {
+          try {
+            socket.addMembership(MULTICAST_ADDRESS, ip)
+          } catch {
+            /* Interface may not support multicast. */
+          }
+        }
+        resolve()
+      })
+    })
+  } catch (error) {
+    if (multicastSocket === socket) multicastSocket = undefined
+    try {
+      socket.close()
+    } catch {
+      /* Socket may not have bound. */
+    }
+    throw error
+  }
+  announce(true)
+  return () => {
+    if (multicastSocket === socket) multicastSocket = undefined
+    socket.close()
+    multicastDevices.clear()
+    onDeviceFound = undefined
+  }
+}
+
 export async function scanNetwork(ctx: Context, timeoutMs: number = 5000, api: PublicAPI): Promise<LocalSendDevice[]> {
   await api.Log(ctx, "Info", "Scanning network for devices...")
   const localIPs = getLocalIPs()
   const devices: LocalSendDevice[] = []
-  const promises: Promise<void>[] = []
+  const subnets = new Set(localIPs.map(ip => ip.split(".").slice(0, 3).join(".")))
 
-  for (const localIP of localIPs) {
-    const subnet = localIP.split(".").slice(0, 3).join(".")
-
-    // Scan common IP range
+  for (const subnet of Array.from(subnets)) {
     for (let i = 1; i <= 254; i++) {
       const targetIP = `${subnet}.${i}`
       if (localIPs.includes(targetIP)) continue
-
-      // Try HTTPS and HTTP
       for (const protocol of ["https", "http"] as const) {
-        promises.push(
-          registerWithDevice(targetIP, DEFAULT_PORT, protocol).then(device => {
-            if (device) {
-              devices.push(device)
-            }
-          })
-        )
+        void registerWithDevice(targetIP, DEFAULT_PORT, protocol).then(device => {
+          if (device) {
+            devices.push(device)
+            onDeviceFound?.(device)
+          }
+        })
       }
     }
   }
 
-  await Promise.race([Promise.all(promises), new Promise(resolve => setTimeout(resolve, timeoutMs))])
-
-  return devices
+  multicastDevices.clear()
+  announce(true)
+  await new Promise(resolve => setTimeout(resolve, timeoutMs))
+  const allDevices = [...devices, ...Array.from(multicastDevices.values())]
+  const unique = new Map<string, LocalSendDevice>()
+  for (const device of allDevices) unique.set(device.fingerprint || device.ip, device)
+  return Array.from(unique.values()).sort((a, b) => a.alias.localeCompare(b.alias) || a.ip.localeCompare(b.ip))
 }
 
 export async function findDevices(ctx: Context, timeoutMs: number = 3000, api: PublicAPI): Promise<LocalSendDevice[]> {
-  await api.Log(ctx, "Info", "Discovering devices...")
   const devices = await scanNetwork(ctx, timeoutMs, api)
-  await api.Log(ctx, "Info", "HTTP network scan found devices: " + devices.length)
+  await api.Log(ctx, "Info", "Network scan found devices: " + devices.length)
   return devices
 }
