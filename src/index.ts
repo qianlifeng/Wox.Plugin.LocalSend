@@ -1,10 +1,10 @@
-import { Context, Plugin, PluginInitParams, PublicAPI, Query, Result } from "@wox-launcher/wox-plugin"
+import { Context, Plugin, PluginInitParams, PublicAPI, Query, Result, ResultAction } from "@wox-launcher/wox-plugin"
 import { findDevices, LocalSendDevice, startDiscovery } from "./discovery"
 import { startReceiver } from "./receiver"
 import { ReceiveHistory } from "./history"
 import { spawn } from "child_process"
 import * as os from "os"
-import { configureSender, sendFiles } from "./transfer"
+import { configureSender, sendFiles, sendText } from "./transfer"
 import * as crypto from "crypto"
 import * as fs from "fs"
 import * as path from "path"
@@ -25,6 +25,9 @@ const receiveDirectory = path.join(os.homedir(), "Downloads", "LocalSend")
 const SCAN_INTERVAL_MS = 60_000
 const QUERY_SCAN_INTERVAL_MS = 15_000
 const DEVICE_TTL_MS = 2 * 60_000
+const HANDOFF_FILE_PATH_KEY = "localsend.filePath"
+const HANDOFF_TEXT_KEY = "localsend.text"
+type SendPayload = string | string[]
 const IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".heif", ".avif", ".svg"])
 const COPYABLE_IMAGE_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff"])
 const VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".mpeg", ".mpg"])
@@ -147,10 +150,12 @@ function expandDirectories(paths: string[]): string[] {
   return result
 }
 
-const createSendAction = (targetDevice: LocalSendDevice, files: string[], resultId: string) => {
+const createSendAction = (targetDevice: LocalSendDevice, payload: SendPayload, resultId: string) => {
+  const totalCount = typeof payload === "string" ? 1 : payload.length
+  const unitKey = typeof payload === "string" ? "message_unit" : "files_unit"
   return async (actionCtx: Context) => {
     visibleResult = undefined
-    await api.Log(actionCtx, "Info", `Sending ${files.length} file(s) to ${targetDevice.alias}...`)
+    await api.Log(actionCtx, "Info", `Sending ${totalCount} item(s) to ${targetDevice.alias}...`)
 
     // Helper to update UI
     const updateProgress = async (idx: number, total: number, currentFile: string) => {
@@ -167,7 +172,7 @@ const createSendAction = (targetDevice: LocalSendDevice, files: string[], result
             result.SubTitle = util.format(targetTpl, targetDevice.alias)
           } else {
             const sentSuccessTpl = await api.GetTranslation(actionCtx, "sent_success")
-            const filesUnit = await api.GetTranslation(actionCtx, "files_unit")
+            const unit = await api.GetTranslation(actionCtx, unitKey)
             const targetTpl = await api.GetTranslation(actionCtx, "target")
             result.Tails = [
               {
@@ -178,7 +183,7 @@ const createSendAction = (targetDevice: LocalSendDevice, files: string[], result
                 Tooltip: await api.GetTranslation(actionCtx, "send_complete")
               }
             ]
-            result.Title = util.format(sentSuccessTpl, total, filesUnit)
+            result.Title = util.format(sentSuccessTpl, total, unit)
             result.SubTitle = util.format(targetTpl, targetDevice.alias)
           }
           await api.UpdateResult(actionCtx, result)
@@ -191,61 +196,54 @@ const createSendAction = (targetDevice: LocalSendDevice, files: string[], result
     }
 
     try {
-      // Initial status
-      await updateProgress(0, files.length, "i18n:preparing")
+      await updateProgress(0, totalCount, "i18n:preparing")
 
-      const sent = await sendFiles(
-        targetDevice,
-        files,
-        async (current, total, fileName) => {
-          await updateProgress(current, total, fileName)
-        },
-        async (error, fileName) => {
-          const errorMsg = error instanceof Error ? error.message : "Unknown error"
-          try {
-            const result = await api.GetUpdatableResult(actionCtx, resultId)
-            if (result) {
-              result.Title = "i18n:failed_to_send"
-              result.Tails = []
-              const errorSendingTpl = await api.GetTranslation(actionCtx, "error_sending")
-              result.SubTitle = fileName ? util.format(errorSendingTpl, fileName, errorMsg) : errorMsg
-              result.Actions = [
-                {
-                  Name: "i18n:retry_send",
-                  PreventHideAfterAction: true,
-                  Action: createSendAction(targetDevice, files, resultId)
-                },
-                {
-                  Name: "i18n:refresh_devices",
-                  PreventHideAfterAction: true,
-                  Action: async () => {
-                    await refreshDevices(actionCtx)
-                    await api.RefreshQuery(actionCtx, { PreserveSelectedIndex: true })
-                  }
+      const reportError = async (error: Error, fileName: string) => {
+        const errorMsg = error.message
+        try {
+          const result = await api.GetUpdatableResult(actionCtx, resultId)
+          if (result) {
+            result.Title = "i18n:failed_to_send"
+            result.Tails = []
+            const errorSendingTpl = await api.GetTranslation(actionCtx, "error_sending")
+            result.SubTitle = fileName ? util.format(errorSendingTpl, fileName, errorMsg) : errorMsg
+            result.Actions = [
+              {
+                Name: "i18n:retry_send",
+                PreventHideAfterAction: true,
+                Action: createSendAction(targetDevice, payload, resultId)
+              },
+              {
+                Name: "i18n:refresh_devices",
+                PreventHideAfterAction: true,
+                Action: async () => {
+                  await refreshDevices(actionCtx)
+                  await api.RefreshQuery(actionCtx, { PreserveSelectedIndex: true })
                 }
-              ]
-              await api.UpdateResult(actionCtx, result)
-            }
-          } catch {
-            // Ignore error
+              }
+            ]
+            await api.UpdateResult(actionCtx, result)
           }
+        } catch {
+          // The query may have changed before the transfer failed.
         }
-      )
+      }
+      const sent = typeof payload === "string" ? await sendText(targetDevice, payload, updateProgress, reportError) : await sendFiles(targetDevice, payload, updateProgress, reportError)
 
       if (!sent) return
-      await updateProgress(files.length, files.length, "")
+      await updateProgress(totalCount, totalCount, "")
       try {
         const successTpl = await api.GetTranslation(actionCtx, "successfully_sent")
-        const filesUnit = await api.GetTranslation(actionCtx, "files_unit")
-        await api.Notify(actionCtx, util.format(successTpl, files.length, filesUnit, targetDevice.alias))
-        await api.Log(actionCtx, "Info", `Successfully sent files to ${targetDevice.alias}`)
+        const unit = await api.GetTranslation(actionCtx, unitKey)
+        await api.Notify(actionCtx, util.format(successTpl, totalCount, unit, targetDevice.alias))
+        await api.Log(actionCtx, "Info", `Successfully sent to ${targetDevice.alias}`)
       } catch {
         // A notification failure must not change the transfer outcome.
       }
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : "Unknown error"
-      await api.Notify(actionCtx, `Failed to send files: ${errorMsg}`)
-      await api.Log(actionCtx, "Error", `Failed to send files: ${errorMsg}`)
+      await api.Notify(actionCtx, `Failed to send: ${errorMsg}`)
+      await api.Log(actionCtx, "Error", `Failed to send: ${errorMsg}`)
 
       // Show error in result
       try {
@@ -391,18 +389,31 @@ export const plugin = {
   },
 
   query: async (ctx: Context, query: Query): Promise<Result[]> => {
-    if (query.Type === "input" && query.TriggerKeyword === "receive") {
+    const handoff = query.Type === "input" && !query.Search.trim() ? query.ContextData : undefined
+    const handoffFile = handoff?.[HANDOFF_FILE_PATH_KEY]
+    const handoffText = handoff?.[HANDOFF_TEXT_KEY]
+    if (query.Type === "input" && query.TriggerKeyword === "receive" && handoffFile === undefined && !handoffText) {
       visibleResult = undefined
       return receiveHistoryResults(ctx, query.Search)
     }
     visibleHistory = undefined
-    let filePaths: string[] = []
-    if (query.Type === "selection") {
+    let payload: SendPayload | undefined
+    if (handoffText) {
+      payload = handoffText
+    } else if (handoffFile !== undefined) {
+      const stats = path.isAbsolute(handoffFile) ? await fs.promises.stat(handoffFile).catch(() => undefined) : undefined
+      if (!stats?.isFile()) {
+        visibleResult = undefined
+        return [{ Title: "i18n:no_files", SubTitle: "i18n:handoff_file_missing", Icon: { ImageType: "relative", ImageData: "images/app.png" } }]
+      }
+      payload = [handoffFile]
+    } else if (query.Type === "selection") {
       if (!query.Selection?.FilePaths?.length) return []
-      filePaths = expandDirectories(query.Selection.FilePaths)
+      const filePaths = expandDirectories(query.Selection.FilePaths)
       if (filePaths.length === 0) {
         return [{ Title: "i18n:no_files", SubTitle: "i18n:folders_empty", Icon: { ImageType: "relative", ImageData: "images/app.png" } }]
       }
+      payload = filePaths
     } else if (query.Search.trim() !== "") {
       visibleResult = undefined
       return []
@@ -415,7 +426,7 @@ export const plugin = {
     const waiting = devices.length === 0 && (!hasScanned || !!currentScan)
     const resultId = crypto.randomUUID()
     const results: Result[] = devices.length
-      ? await devicesToResults(ctx, devices, filePaths)
+      ? await devicesToResults(ctx, devices, payload)
       : [
           {
             Id: resultId,
@@ -452,6 +463,52 @@ async function receiveHistoryResults(ctx: Context, search: string): Promise<Resu
     const time = today
       ? received.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })
       : received.toLocaleString(undefined, { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })
+    const singleFile = transfer.files.length === 1 ? transfer.files[0] : undefined
+    const extension = singleFile ? path.extname(singleFile).toLowerCase() : ""
+    const copyType = extension === ".txt" ? "text" : COPYABLE_IMAGE_EXTENSIONS.has(extension) ? "image" : undefined
+    const actions: ResultAction[] = []
+    if (singleFile && copyType) {
+      actions.push({
+        Name: `i18n:copy_${copyType}`,
+        Icon: { ImageType: "svg", ImageData: COPY_ICON },
+        IsDefault: true,
+        Action: async actionCtx => {
+          try {
+            if (copyType === "text") {
+              const text = await fs.promises.readFile(singleFile, "utf8")
+              await api.Copy(actionCtx, { type: "text", text })
+            } else {
+              await fs.promises.access(singleFile, fs.constants.R_OK)
+              await api.Copy(actionCtx, { type: "image", text: "", woxImage: { ImageType: "absolute", ImageData: singleFile } })
+            }
+          } catch (error) {
+            const template = await api.GetTranslation(actionCtx, `copy_${copyType}_failed`)
+            await api.Notify(actionCtx, util.format(template, String(error)))
+          }
+        }
+      })
+    }
+    actions.push({
+      Name: "i18n:open_receive_folder",
+      ...(copyType ? { Hotkey: "ctrl+enter" } : { IsDefault: true }),
+      Action: async actionCtx => {
+        try {
+          await fs.promises.access(transfer.directory)
+          const command = process.platform === "win32" ? "explorer.exe" : process.platform === "darwin" ? "open" : "xdg-open"
+          await new Promise<void>((resolve, reject) => {
+            const child = spawn(command, [transfer.directory], { detached: true, stdio: "ignore" })
+            child.once("error", reject)
+            child.once("spawn", () => {
+              child.unref()
+              resolve()
+            })
+          })
+        } catch (error) {
+          const template = await api.GetTranslation(actionCtx, "open_folder_failed")
+          await api.Notify(actionCtx, util.format(template, String(error)))
+        }
+      }
+    })
     return {
       Id: crypto.randomUUID(),
       IdentityKey: `receive:${transfer.sessionId}`,
@@ -464,63 +521,7 @@ async function receiveHistoryResults(ctx: Context, search: string): Promise<Resu
       Icon: { ImageType: "relative", ImageData: "images/app.png" },
       Preview:
         transfer.files.length === 1 ? { PreviewType: "file", PreviewData: transfer.files[0] } : { PreviewType: "text", PreviewData: transfer.files.map(file => `• ${path.basename(file)}`).join("\n") },
-      Actions: [
-        {
-          Name: "i18n:open_receive_folder",
-          IsDefault: true,
-          Action: async actionCtx => {
-            try {
-              await fs.promises.access(transfer.directory)
-              const command = process.platform === "win32" ? "explorer.exe" : process.platform === "darwin" ? "open" : "xdg-open"
-              await new Promise<void>((resolve, reject) => {
-                const child = spawn(command, [transfer.directory], { detached: true, stdio: "ignore" })
-                child.once("error", reject)
-                child.once("spawn", () => {
-                  child.unref()
-                  resolve()
-                })
-              })
-            } catch (error) {
-              const template = await api.GetTranslation(actionCtx, "open_folder_failed")
-              await api.Notify(actionCtx, util.format(template, String(error)))
-            }
-          }
-        },
-        ...(transfer.files.length === 1 && path.extname(transfer.files[0]).toLowerCase() === ".txt"
-          ? [
-              {
-                Name: "i18n:copy_text",
-                Icon: { ImageType: "svg" as const, ImageData: COPY_ICON },
-                Action: async (actionCtx: Context) => {
-                  try {
-                    const text = await fs.promises.readFile(transfer.files[0], "utf8")
-                    await api.Copy(actionCtx, { type: "text", text })
-                  } catch (error) {
-                    const template = await api.GetTranslation(actionCtx, "copy_text_failed")
-                    await api.Notify(actionCtx, util.format(template, String(error)))
-                  }
-                }
-              }
-            ]
-          : []),
-        ...(transfer.files.length === 1 && COPYABLE_IMAGE_EXTENSIONS.has(path.extname(transfer.files[0]).toLowerCase())
-          ? [
-              {
-                Name: "i18n:copy_image",
-                Icon: { ImageType: "svg" as const, ImageData: COPY_ICON },
-                Action: async (actionCtx: Context) => {
-                  try {
-                    await fs.promises.access(transfer.files[0], fs.constants.R_OK)
-                    await api.Copy(actionCtx, { type: "image", text: "", woxImage: { ImageType: "absolute", ImageData: transfer.files[0] } })
-                  } catch (error) {
-                    const template = await api.GetTranslation(actionCtx, "copy_image_failed")
-                    await api.Notify(actionCtx, util.format(template, String(error)))
-                  }
-                }
-              }
-            ]
-          : [])
-      ]
+      Actions: actions
     }
   })
   if (!results.length) results.push({ Id: crypto.randomUUID(), Title: "i18n:receive_empty", Icon: { ImageType: "relative", ImageData: "images/app.png" } })
@@ -528,32 +529,33 @@ async function receiveHistoryResults(ctx: Context, search: string): Promise<Resu
   return results
 }
 
-async function devicesToResults(ctx: Context, devices: LocalSendDevice[], filePaths: string[]): Promise<Result[]> {
-  const [sendToTpl, filesToSend] = filePaths.length ? await Promise.all([api.GetTranslation(ctx, "send_to"), api.GetTranslation(ctx, "files_to_send")]) : ["", ""]
+async function devicesToResults(ctx: Context, devices: LocalSendDevice[], payload?: SendPayload): Promise<Result[]> {
+  const files = Array.isArray(payload) ? payload : []
+  const [sendToTpl, filesToSend] = await Promise.all([payload ? api.GetTranslation(ctx, "send_to") : "", files.length > 1 ? api.GetTranslation(ctx, "files_to_send") : ""])
   return devices.map(device => {
     const resultId = crypto.randomUUID()
     const result: Result = {
       Id: resultId,
-      Title: filePaths.length ? util.format(sendToTpl, device.alias) : device.alias,
+      Title: payload ? util.format(sendToTpl, device.alias) : device.alias,
       SubTitle: formatDeviceSubtitle(device),
       Icon: { ImageType: "relative", ImageData: "images/app.png" }
     }
-    if (filePaths.length) {
+    if (payload) {
       result.Preview = {
-        PreviewType: filePaths.length === 1 ? "file" : "text",
-        PreviewData: filePaths.length === 1 ? filePaths[0] : `${filesToSend}\n${filePaths.map(p => `• ${p}`).join("\n")}`,
+        PreviewType: files.length === 1 ? "file" : "text",
+        PreviewData: typeof payload === "string" ? payload : files.length === 1 ? files[0] : `${filesToSend}\n${files.map(p => `• ${p}`).join("\n")}`,
         PreviewProperties: {
           "i18n:device_label": device.alias,
           "i18n:ip_label": device.ip,
           "i18n:protocol_label": device.protocol.toUpperCase(),
-          "i18n:file_count_label": filePaths.length.toString()
+          ...(files.length ? { "i18n:file_count_label": files.length.toString() } : {})
         }
       }
       result.Actions = [
         {
           Name: "i18n:send",
           PreventHideAfterAction: true,
-          Action: createSendAction(device, filePaths, resultId)
+          Action: createSendAction(device, payload, resultId)
         }
       ]
     }

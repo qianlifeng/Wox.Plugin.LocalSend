@@ -5,7 +5,7 @@ import * as os from "os"
 import * as path from "path"
 import { startReceiver } from "./receiver"
 import { ReceiveHistory } from "./history"
-import { configureSender, prepareUpload } from "./transfer"
+import { configureSender, prepareUpload, sendText } from "./transfer"
 
 function request(port: number, method: string, route: string, body?: string | Buffer, credentials?: { key: string; cert: string }): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
@@ -111,6 +111,12 @@ it("advertises a TLS receiver and safely saves verified files without overwritin
     const bad = JSON.parse((await request(port, "POST", "/api/localsend/v2/prepare-upload", badMeta)).body) as { sessionId: string; files: Record<string, string> }
     expect((await request(port, "POST", `/api/localsend/v2/upload?sessionId=${bad.sessionId}&fileId=b&token=${bad.files.b}`, content)).status).toBe(422)
     expect(history.list()).toHaveLength(1)
+
+    const message = "  剪贴板\r\nHello 🙂\n "
+    expect(await sendText({ ...receiver.identity, ip: "127.0.0.1" }, message)).toBe(true)
+    const savedMessage = notify.mock.lastCall![0]
+    expect(path.basename(savedMessage)).toBe("message.txt")
+    expect(fs.readFileSync(savedMessage, "utf8")).toBe(message)
   } finally {
     await receiver.close()
     if (path.dirname(root) === os.tmpdir() && path.basename(root).startsWith("wox-localsend-test-")) fs.rmSync(root, { recursive: true, force: true })

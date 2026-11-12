@@ -1,7 +1,7 @@
 import { Context, PluginInitParams, PublicAPI, Query } from "@wox-launcher/wox-plugin"
 import { findDevices, LocalSendDevice, startDiscovery } from "./discovery"
 import { startReceiver } from "./receiver"
-import { sendFiles } from "./transfer"
+import { sendFiles, sendText } from "./transfer"
 import { ReceiveHistory } from "./history"
 import * as fs from "fs"
 import * as os from "os"
@@ -13,7 +13,7 @@ jest.mock("os", () => ({ ...jest.requireActual("os"), homedir: jest.fn() }))
 jest.mock("child_process", () => ({ spawn: jest.fn() }))
 jest.mock("./discovery", () => ({ findDevices: jest.fn(), startDiscovery: jest.fn().mockResolvedValue(() => {}) }))
 jest.mock("./receiver", () => ({ startReceiver: jest.fn().mockResolvedValue({ identity: { alias: "Wox - test", port: 53317 }, close: jest.fn() }) }))
-jest.mock("./transfer", () => ({ sendFiles: jest.fn(), configureSender: jest.fn() }))
+jest.mock("./transfer", () => ({ sendFiles: jest.fn(), sendText: jest.fn(), configureSender: jest.fn() }))
 
 const ctx = {} as Context
 const phone = { alias: "Phone", fingerprint: "phone", ip: "192.168.1.2", port: 53317, protocol: "https", version: "2.0", deviceModel: null, deviceType: "mobile" } as LocalSendDevice
@@ -74,6 +74,32 @@ it("lists cached devices and refreshes visible results after background scans", 
   expect((await plugin.query(ctx, query("input", { TriggerKeyword: "custom" }))).length).toBe(2)
   expect(await plugin.query(ctx, query("input", { Search: "phone" }))).toEqual([])
 
+  const message = "  剪贴板\r\nHello 🙂\n "
+  const messagePicker = await plugin.query(ctx, query("input", { TriggerKeyword: "share", ContextData: { "localsend.text": message } }))
+  expect(messagePicker.map(result => result.Title)).toEqual(["Send to Phone", "Send to Tablet"])
+  expect(messagePicker[0].Preview).toMatchObject({ PreviewType: "text", PreviewData: message })
+  expect(sendText).not.toHaveBeenCalled()
+  const sendMessage = messagePicker[0].Actions![0]
+  if (!("Action" in sendMessage)) throw new Error("Expected a send action")
+  jest.mocked(sendText).mockResolvedValueOnce(true)
+  await sendMessage.Action(ctx, {} as never)
+  expect(sendText).toHaveBeenLastCalledWith(expect.objectContaining({ fingerprint: phone.fingerprint }), message, expect.any(Function), expect.any(Function))
+
+  const imagePath = path.join(cacheDir, "剪贴板 image.png")
+  fs.writeFileSync(imagePath, "image")
+  const handoff = query("input", { TriggerKeyword: "share", ContextData: { "localsend.filePath": imagePath } })
+  const picker = await plugin.query(ctx, handoff)
+  expect(picker.map(result => result.Title)).toEqual(["Send to Phone", "Send to Tablet"])
+  expect(picker[0].Preview).toMatchObject({ PreviewType: "file", PreviewData: imagePath })
+  expect(sendFiles).not.toHaveBeenCalled()
+  const sendImage = picker[0].Actions![0]
+  if (!("Action" in sendImage)) throw new Error("Expected a send action")
+  jest.mocked(sendFiles).mockResolvedValueOnce(true)
+  await sendImage.Action(ctx, {} as never)
+  expect(sendFiles).toHaveBeenLastCalledWith(expect.objectContaining({ fingerprint: phone.fingerprint }), [imagePath], expect.any(Function), expect.any(Function))
+  fs.unlinkSync(imagePath)
+  expect(await plugin.query(ctx, handoff)).toMatchObject([{ Title: "i18n:no_files", SubTitle: "i18n:handoff_file_missing" }])
+
   const selected = await plugin.query(ctx, query("selection", { Selection: { FilePaths: [__filename] } }))
   expect(selected.map(result => result.Title)).toEqual(["Send to Phone", "Send to Tablet"])
   expect(selected.every(result => result.Actions?.length === 1)).toBe(true)
@@ -114,7 +140,7 @@ it("lists cached devices and refreshes visible results after background scans", 
   expect((await plugin.query(ctx, query("input"))).map(result => result.Title)).toEqual(["Tablet"])
   scan.mockResolvedValueOnce([])
   await jest.advanceTimersByTimeAsync(60_000)
-  const empty = (await plugin.query(ctx, query("input")))[0]
+  const empty = (await plugin.query(ctx, query("input", { ContextData: { "localsend.filePath": __filename } })))[0]
   expect(empty.Title).toBe("i18n:no_devices_found")
   expect(empty.Actions?.[0]).toMatchObject({ Name: "i18n:retry", IsDefault: true, PreventHideAfterAction: true })
   let finishRetry!: (devices: LocalSendDevice[]) => void
@@ -202,11 +228,19 @@ it("lists cached devices and refreshes visible results after background scans", 
   expect(history[1].Preview?.PreviewData).toContain("one.txt")
   expect(history[1].Preview?.PreviewData).toContain("two.txt")
   expect(history[1].Actions?.[0]).toMatchObject({ Name: "i18n:open_receive_folder", IsDefault: true })
+  expect(history[1].Actions?.[0].Hotkey).toBeUndefined()
   expect(history[1].Actions).toHaveLength(1)
-  expect(history[2].Actions?.[0]).toMatchObject({ Name: "i18n:open_receive_folder", IsDefault: true })
-  expect(history[0].Actions?.[0]).toMatchObject({ Name: "i18n:open_receive_folder", IsDefault: true })
-  const copy = history[0].Actions![1]
-  expect(copy.Name).toBe("i18n:copy_text")
+  for (const [result, copyName] of [
+    [history[0], "i18n:copy_text"],
+    [history[2], "i18n:copy_image"]
+  ] as const) {
+    expect(result.Actions).toMatchObject([
+      { Name: copyName, IsDefault: true },
+      { Name: "i18n:open_receive_folder", Hotkey: "ctrl+enter" }
+    ])
+    expect(result.Actions?.[1].IsDefault).not.toBe(true)
+  }
+  const copy = history[0].Actions![0]
   if (!("Action" in copy)) throw new Error("Expected a copy action")
   await copy.Action(ctx, {} as never)
   expect(api.Copy).toHaveBeenCalledWith(ctx, { type: "text", text: "可口可乐\n第二行" })
@@ -215,8 +249,7 @@ it("lists cached devices and refreshes visible results after background scans", 
   expect(api.Copy).toHaveBeenCalledTimes(1)
   expect(api.Notify).toHaveBeenCalledWith(ctx, expect.stringContaining("copy_text_failed"))
   fs.writeFileSync(path.join(transfer2, "three.txt"), "data")
-  const copyImage = history[2].Actions![1]
-  expect(copyImage.Name).toBe("i18n:copy_image")
+  const copyImage = history[2].Actions![0]
   if (!("Action" in copyImage)) throw new Error("Expected a copy image action")
   await copyImage.Action(ctx, {} as never)
   expect(api.Copy).toHaveBeenCalledWith(ctx, { type: "image", text: "", woxImage: { ImageType: "absolute", ImageData: path.join(old, "older.jpg") } })
@@ -231,19 +264,31 @@ it("lists cached devices and refreshes visible results after background scans", 
     setImmediate(() => child.emit("spawn"))
     return child as never
   })
-  const open = history[1].Actions![0]
-  if (!("Action" in open)) throw new Error("Expected an open-folder action")
-  const opening = open.Action(ctx, {} as never)
-  await jest.advanceTimersByTimeAsync(0)
-  await opening
   const command = process.platform === "win32" ? "explorer.exe" : process.platform === "darwin" ? "open" : "xdg-open"
-  expect(spawn).toHaveBeenCalledWith(command, [transfer1], { detached: true, stdio: "ignore" })
+  for (const [open, folder] of [
+    [history[1].Actions![0], transfer1],
+    [history[0].Actions![1], transfer2]
+  ] as const) {
+    if (!("Action" in open)) throw new Error("Expected an open-folder action")
+    const opening = open.Action(ctx, {} as never)
+    await jest.advanceTimersByTimeAsync(0)
+    await opening
+    expect(spawn).toHaveBeenLastCalledWith(command, [folder], { detached: true, stdio: "ignore" })
+  }
   access.mockRestore()
   const filtered = await plugin.query(ctx, query("input", { TriggerKeyword: "receive", Search: "two" }))
   expect(filtered.map(result => result.Title)).toEqual(["one.txt"])
   if (path.dirname(transfer1) === root && path.basename(transfer1) === "transfer-1") fs.rmSync(transfer1, { recursive: true, force: true })
   const afterRemoval = await plugin.query(ctx, query("input", { TriggerKeyword: "receive" }))
   expect(afterRemoval.map(result => result.Title)).toEqual(["three.txt", "older.jpg"])
+  const pdfDir = path.join(root, "pdf-transfer")
+  const pdf = path.join(pdfDir, "report.pdf")
+  fs.mkdirSync(pdfDir)
+  fs.writeFileSync(pdf, "data")
+  new ReceiveHistory(root).record({ sessionId: "pdf-transfer", sender: "Laptop", filePath: pdf, receivedAt: new Date().toISOString() })
+  const [pdfResult] = await plugin.query(ctx, query("input", { TriggerKeyword: "receive", Search: "report.pdf" }))
+  expect(pdfResult.Actions).toMatchObject([{ Name: "i18n:open_receive_folder", IsDefault: true }])
+  expect(pdfResult.Actions?.[0].Hotkey).toBeUndefined()
   const unload = jest.mocked(api.OnUnload).mock.calls[0][1]
   await unload(ctx)
   await jest.advanceTimersByTimeAsync(60_000)

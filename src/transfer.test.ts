@@ -4,7 +4,7 @@ import * as os from "os"
 import * as path from "path"
 import { LocalSendDevice } from "./discovery"
 import { ReceiverIdentity } from "./receiver"
-import { configureSender, sendFiles } from "./transfer"
+import { configureSender, FileInfo, sendFiles, sendText } from "./transfer"
 
 it("reports success only after upload and reports handled transfer failures", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wox-send-test-"))
@@ -55,5 +55,53 @@ it("reports success only after upload and reports handled transfer failures", as
   } finally {
     await new Promise<void>(resolve => server.close(() => resolve()))
     if (path.dirname(root) === os.tmpdir() && path.basename(root).startsWith("wox-send-test-")) fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+it("sends native UTF-8 messages and uploads the original bytes when requested", async () => {
+  const prepared: FileInfo[] = []
+  const uploaded: Buffer[] = []
+  let acceptPreview = true
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = []
+    req.on("data", chunk => chunks.push(chunk))
+    req.on("end", () => {
+      const body = Buffer.concat(chunks)
+      if (req.url === "/api/localsend/v2/prepare-upload") {
+        const file = Object.values((JSON.parse(body.toString("utf8")) as { files: Record<string, FileInfo> }).files)[0]
+        prepared.push(file)
+        if (file.preview !== undefined && acceptPreview) {
+          res.writeHead(204).end()
+        } else {
+          res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ sessionId: "session", files: { [file.id]: "token" } }))
+        }
+      } else {
+        uploaded.push(body)
+        res.writeHead(200).end()
+      }
+    })
+  })
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve))
+  try {
+    const port = (server.address() as { port: number }).port
+    const device = { ip: "127.0.0.1", port, protocol: "http" } as LocalSendDevice
+    configureSender({ alias: "Wox" } as ReceiverIdentity, { key: "", cert: "" })
+    const message = "  剪贴板\r\nHello 🙂\n "
+    expect(await sendText(device, message)).toBe(true)
+    expect(prepared[0]).toMatchObject({ fileType: "text/plain", size: Buffer.byteLength(message), preview: message })
+    expect(uploaded).toEqual([])
+
+    acceptPreview = false
+    expect(await sendText(device, message)).toBe(true)
+    expect(uploaded[0]).toEqual(Buffer.from(message))
+
+    acceptPreview = true
+    const longMessage = "测".repeat(22_000)
+    expect(await sendText(device, longMessage)).toBe(true)
+    expect(prepared[2]).toMatchObject({ fileName: "message.txt", size: Buffer.byteLength(longMessage) })
+    expect(prepared[2].preview).toBeUndefined()
+    expect(uploaded[1]).toEqual(Buffer.from(longMessage))
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()))
   }
 })

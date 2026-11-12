@@ -26,6 +26,10 @@ export interface TransferSession {
   files: { [fileId: string]: string } // fileId -> token mapping
 }
 
+type TransferFile = { info: FileInfo; readContent: () => Buffer }
+type TransferProgress = (currentIndex: number, totalCount: number, fileName: string) => void | Promise<void>
+type TransferError = (error: Error, fileName: string) => void | Promise<void>
+
 let senderInfo: ReceiverIdentity
 let senderCredentials: { key: string; cert: string }
 
@@ -164,7 +168,7 @@ export async function prepareUpload(device: LocalSendDevice, files: FileInfo[]):
   const response = await makeRequest(device, "/api/localsend/v2/prepare-upload", "POST", JSON.stringify(requestBody), "application/json", 60000)
 
   if (response.statusCode === 204) {
-    // No transfer needed (file may already exist)
+    // The receiver completed the transfer from metadata alone.
     return { sessionId: "", files: {} }
   }
 
@@ -196,20 +200,17 @@ export async function prepareUpload(device: LocalSendDevice, files: FileInfo[]):
   return JSON.parse(response.body) as TransferSession
 }
 
-// Upload single file
-export async function uploadFile(device: LocalSendDevice, session: TransferSession, fileInfo: FileInfo, filePath: string): Promise<void> {
-  const token = session.files[fileInfo.id]
+// Upload the bytes requested by the receiver after accepting the metadata.
+async function uploadFile(device: LocalSendDevice, session: TransferSession, file: TransferFile): Promise<void> {
+  const token = session.files[file.info.id]
   if (!token) {
-    throw new Error(`No token for file: ${fileInfo.fileName}`)
+    throw new Error(`No token for file: ${file.info.fileName}`)
   }
 
-  const queryParams = `sessionId=${encodeURIComponent(session.sessionId)}&fileId=${encodeURIComponent(fileInfo.id)}&token=${encodeURIComponent(token)}`
+  const queryParams = `sessionId=${encodeURIComponent(session.sessionId)}&fileId=${encodeURIComponent(file.info.id)}&token=${encodeURIComponent(token)}`
   const uploadPath = `/api/localsend/v2/upload?${queryParams}`
 
-  // Read file content
-  const fileContent = fs.readFileSync(filePath)
-
-  const response = await makeRequest(device, uploadPath, "POST", fileContent, "application/octet-stream")
+  const response = await makeRequest(device, uploadPath, "POST", file.readContent(), "application/octet-stream")
 
   if (response.statusCode !== 200 && response.statusCode !== 204) {
     throw new Error(`Upload failed with status ${response.statusCode}: ${response.body}`)
@@ -223,29 +224,42 @@ export async function cancelTransfer(device: LocalSendDevice, sessionId: string)
 }
 
 // High-level API: Send files to device
-export async function sendFiles(
-  device: LocalSendDevice,
-  filePaths: string[],
-  onProgress?: (currentIndex: number, totalCount: number, fileName: string) => void | Promise<void>,
-  onError?: (error: Error, fileName: string) => void | Promise<void>
-): Promise<boolean> {
-  // Create file information
-  const fileInfos: FileInfo[] = []
-  const filePathMap: Map<string, string> = new Map()
+export async function sendFiles(device: LocalSendDevice, filePaths: string[], onProgress?: TransferProgress, onError?: TransferError): Promise<boolean> {
+  const files: TransferFile[] = []
 
   for (const filePath of filePaths) {
     if (!fs.existsSync(filePath)) {
       throw new Error(`i18n:error_file_not_found: ${filePath}`)
     }
     const info = await createFileInfo(filePath)
-    fileInfos.push(info)
-    filePathMap.set(info.id, filePath)
+    files.push({ info, readContent: () => fs.readFileSync(filePath) })
   }
+  return sendPreparedFiles(device, files, onProgress, onError)
+}
 
-  // Prepare upload
+// Text-aware receivers can accept a message from the preview in prepare-upload.
+// Longer messages follow the LocalSend CLI's 64 KiB threshold and upload as UTF-8 files.
+export function sendText(device: LocalSendDevice, text: string, onProgress?: TransferProgress, onError?: TransferError): Promise<boolean> {
+  const bytes = Buffer.from(text, "utf8")
+  const info: FileInfo = {
+    id: generateId(),
+    fileName: "message.txt",
+    fileType: "text/plain",
+    size: bytes.length,
+    sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+    preview: bytes.length <= 64 * 1024 ? text : undefined
+  }
+  return sendPreparedFiles(device, [{ info, readContent: () => bytes }], onProgress, onError)
+}
+
+// Run the same preparation and upload for file paths and in-memory text.
+async function sendPreparedFiles(device: LocalSendDevice, files: TransferFile[], onProgress?: TransferProgress, onError?: TransferError): Promise<boolean> {
   let session: TransferSession
   try {
-    session = await prepareUpload(device, fileInfos)
+    session = await prepareUpload(
+      device,
+      files.map(file => file.info)
+    )
   } catch (error) {
     if (onError) {
       await onError(error instanceof Error ? error : new Error(String(error)), "")
@@ -261,17 +275,16 @@ export async function sendFiles(
 
   // Upload each file
   let completed = 0
-  for (const fileInfo of fileInfos) {
+  for (const file of files) {
     if (onProgress) {
-      await onProgress(completed, fileInfos.length, fileInfo.fileName)
+      await onProgress(completed, files.length, file.info.fileName)
     }
 
-    const filePath = filePathMap.get(fileInfo.id)!
     try {
-      await uploadFile(device, session, fileInfo, filePath)
+      await uploadFile(device, session, file)
     } catch (error) {
       if (onError) {
-        await onError(error instanceof Error ? error : new Error(String(error)), fileInfo.fileName)
+        await onError(error instanceof Error ? error : new Error(String(error)), file.info.fileName)
         return false
       }
       throw error
