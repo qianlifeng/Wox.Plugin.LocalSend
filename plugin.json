@@ -7,7 +7,7 @@
   "Name": "i18n:name",
   "Description": "i18n:description",
   "Author": "qianlifeng",
-  "Version": "0.1.3",
+  "Version": "0.1.4",
   "MinWoxVersion": "2.5.0",
   "Runtime": "nodejs",
   "Website": "https://github.com/qianlifeng/Wox.Plugin.LocalSend",

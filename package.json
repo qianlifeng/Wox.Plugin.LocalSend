@@ -1,6 +1,6 @@
 {
   "name": "wox-plugin-localsend",
-  "version": "0.0.1",
+  "version": "0.1.4",
   "scripts": {
     "build": "pnpm clean && ncc build src/index.ts -o dist && babel dist --out-dir dist && node -e \"require('fs').cpSync('images', 'dist/images', { recursive: true }); require('fs').copyFileSync('plugin.json', 'dist/plugin.json')\"",
     "package": "pnpm build && cd dist && zip -r ../wox-plugin-localsend.wox *.js *.json images",

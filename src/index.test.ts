@@ -72,7 +72,6 @@ it("lists cached devices and refreshes visible results after background scans", 
   expect(listed.map(result => result.Title)).toEqual(["Phone", "Tablet"])
   expect(scan).toHaveBeenCalledTimes(1)
   expect((await plugin.query(ctx, query("input", { TriggerKeyword: "custom" }))).length).toBe(2)
-  expect(await plugin.query(ctx, query("input", { Search: "phone" }))).toEqual([])
 
   const message = "  剪贴板\r\nHello 🙂\n "
   const messagePicker = await plugin.query(ctx, query("input", { TriggerKeyword: "share", ContextData: { "localsend.text": message } }))
@@ -84,6 +83,17 @@ it("lists cached devices and refreshes visible results after background scans", 
   jest.mocked(sendText).mockResolvedValueOnce(true)
   await sendMessage.Action(ctx, {} as never)
   expect(sendText).toHaveBeenLastCalledWith(expect.objectContaining({ fingerprint: phone.fingerprint }), message, expect.any(Function), expect.any(Function))
+
+  const typedMessage = "phone  你好 🙂 "
+  const typedPicker = await plugin.query(ctx, query("input", { Search: typedMessage }))
+  expect(typedPicker.map(result => result.Title)).toEqual(["Send to Phone", "Send to Tablet"])
+  expect(typedPicker[1].Preview).toMatchObject({ PreviewType: "text", PreviewData: typedMessage })
+  expect(sendText).toHaveBeenCalledTimes(1)
+  const sendTypedMessage = typedPicker[1].Actions![0]
+  if (!("Action" in sendTypedMessage)) throw new Error("Expected a send action")
+  jest.mocked(sendText).mockResolvedValueOnce(true)
+  await sendTypedMessage.Action(ctx, {} as never)
+  expect(sendText).toHaveBeenLastCalledWith(expect.objectContaining({ fingerprint: tablet.fingerprint }), typedMessage, expect.any(Function), expect.any(Function))
 
   const imagePath = path.join(cacheDir, "剪贴板 image.png")
   fs.writeFileSync(imagePath, "image")

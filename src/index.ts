@@ -415,8 +415,7 @@ export const plugin = {
       }
       payload = filePaths
     } else if (query.Search.trim() !== "") {
-      visibleResult = undefined
-      return []
+      payload = query.Search
     }
 
     if (!stopped && !currentScan && Date.now() - lastScanStartedAt >= QUERY_SCAN_INTERVAL_MS) {

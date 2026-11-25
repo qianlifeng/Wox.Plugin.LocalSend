@@ -16,6 +16,8 @@ A Wox plugin to send files via LocalSend protocol.
 
 Enter `send` followed by a space in Wox to see discovered LocalSend devices. The plugin listens for device announcements, scans in the background at startup and approximately every minute, and refreshes when you open the list. Cached devices are shown immediately and expire after two minutes without being rediscovered.
 
+To send a message, type `send <message>` in Wox, select a device, and press Enter.
+
 To send files, select them in your file manager and use Wox's selection hotkey, then choose a device from the results.
 
 To send text or an image from Wox Clipboard History, open its Actions, choose **Send via LocalSend**, and select a device. Long text is transferred as a UTF-8 text file.
